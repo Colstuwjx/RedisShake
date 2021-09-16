@@ -14,6 +14,7 @@ import (
 	"github.com/alibaba/RedisShake/pkg/libs/atomic2"
 	"github.com/alibaba/RedisShake/pkg/libs/log"
 	"github.com/alibaba/RedisShake/pkg/redis"
+	"github.com/alibaba/RedisShake/redis-shake/base"
 	utils "github.com/alibaba/RedisShake/redis-shake/common"
 	conf "github.com/alibaba/RedisShake/redis-shake/configure"
 	"github.com/alibaba/RedisShake/redis-shake/filter"
@@ -210,6 +211,16 @@ func (ds *DbSyncer) parseSourceCommand(reader *bufio.Reader) {
 			// FIXME: if redis fired full sync, this will panic.
 			// I prefer just make redis-shake failed, and re-start to do full sync.
 			log.PanicErrorf(err, "DbSyncer[%d] decode resp failed[%v]", ds.id, err)
+
+			// re-enter rdb restore sync mode.
+			base.Status = "full"
+			nsize := int64(23)
+			ds.syncRDBFile(reader, ds.target, conf.Options.TargetAuthType, ds.targetPassword, nsize, conf.Options.TargetTLSEnable)
+			ds.startDbId = 0
+
+			// re-enter incr sync mode.
+			base.Status = "incr"
+			// TODO: WaitFull 是啥作用？
 		}
 
 		if sCmd, argv, err = redis.ParseArgs(resp); err != nil {

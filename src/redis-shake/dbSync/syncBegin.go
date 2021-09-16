@@ -32,6 +32,21 @@ func (ds *DbSyncer) sendSyncCmd(master, authType, passwd string, tlsEnable bool)
 	}
 }
 
+func (ds *DbSyncer) waitReadRDBSize(wait <-chan int64) int64 {
+	var nsize int64
+	for nsize == 0 {
+		select {
+		case nsize = <-wait:
+			if nsize == 0 {
+				log.Infof("DbSyncer[%d] +", ds.id)
+			}
+		case <-time.After(time.Second):
+			log.Infof("DbSyncer[%d] -", ds.id)
+		}
+	}
+	return nsize
+}
+
 func (ds *DbSyncer) sendPSyncCmd(master, authType, passwd string, tlsEnable bool, runId string,
 	prevOffset int64) (pipe.Reader, int64, bool, string) {
 	c := utils.OpenNetConn(master, authType, passwd, tlsEnable)
@@ -60,23 +75,21 @@ func (ds *DbSyncer) sendPSyncCmd(master, authType, passwd string, tlsEnable bool
 	} else {
 		// fullresync
 		log.Infof("DbSyncer[%d] psync runid = %s, offset = %d, fullsync", ds.id, runid, offset)
-
 		// get rdb file size, wait source rdb dump successfully.
-		var nsize int64
-		for nsize == 0 {
-			select {
-			case nsize = <-wait:
-				if nsize == 0 {
-					log.Infof("DbSyncer[%d] +", ds.id)
-				}
-			case <-time.After(time.Second):
-				log.Infof("DbSyncer[%d] -", ds.id)
-			}
-		}
-
+		nsize := ds.waitReadRDBSize(wait)
 		go ds.runIncrementalSync(c, br, bw, int(nsize), runid, offset, master, authType, passwd, tlsEnable, pipew, true)
 		return piper, nsize, true, runid
 	}
+}
+
+func (ds *DbSyncer) readRDBDumpStream(br *bufio.Reader, pipew pipe.Writer, rdbSize int) {
+	p := make([]byte, 8192)
+	// read rdb in for loop
+	for rdbSize != 0 {
+		// br -> pipew
+		rdbSize -= utils.Iocopy(br, pipew, p, rdbSize)
+	}
+	return
 }
 
 func (ds *DbSyncer) runIncrementalSync(c net.Conn, br *bufio.Reader, bw *bufio.Writer, rdbSize int, runId string,
@@ -85,12 +98,7 @@ func (ds *DbSyncer) runIncrementalSync(c net.Conn, br *bufio.Reader, bw *bufio.W
 	// write -> pipew -> piper -> read
 	defer pipew.Close()
 	if isFullSync {
-		p := make([]byte, 8192)
-		// read rdb in for loop
-		for rdbSize != 0 {
-			// br -> pipew
-			rdbSize -= utils.Iocopy(br, pipew, p, rdbSize)
-		}
+		ds.readRDBDumpStream(br, pipew, rdbSize)
 	}
 
 	for {
@@ -130,13 +138,31 @@ func (ds *DbSyncer) runIncrementalSync(c net.Conn, br *bufio.Reader, bw *bufio.W
 				log.Errorf("DbSyncer[%d] Event:SourceConnReopenFail\tId: %s", ds.id, conf.Options.Id)
 			}
 		}
+
 		utils.AuthPassword(c, authType, passwd)
 		utils.SendPSyncListeningPort(c, conf.Options.HttpProfile)
 		br = bufio.NewReaderSize(c, utils.ReaderBufferSize)
 		bw = bufio.NewWriterSize(c, utils.WriterBufferSize)
-		utils.SendPSyncContinue(ds.sourcePsyncCommand, br, bw, runId, offset)
+
+		runid, newOffset, wait := utils.SendPSyncContinue(ds.sourcePsyncCommand, br, bw, runId, offset)
+		if wait == nil {
+			// continue
+			log.Infof("DbSyncer[%d] psync runid = %s, offset = %d, EVENT:PSYNC_CONTINUE", ds.id, runId, offset)
+		} else {
+			// fullresync
+			ds.stat.targetOffset.Set(newOffset)
+			ds.fullSyncOffset = newOffset
+
+			log.Infof("DbSyncer[%d] psync runid = %s, offset = %d, Event:FULLRESYNC", ds.id, runid, offset)
+
+			// get rdb file size, wait source rdb dump successfully.
+			nsize := ds.waitReadRDBSize(wait)
+			log.Infof("DbSyncer[%d] resync rdb file size = %d", ds.id, nsize)
+
+			// TODO: send signal.
+		}
+
 		log.Infof("DbSyncer[%d] Event:ReconnPSyncContinued\tId: %s", ds.id, conf.Options.Id)
-		// 这里是否要根据 fullSync 与否来重新执行一次 rdbSize ioCopy？
 	}
 }
 
